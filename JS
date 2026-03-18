@@ -1,0 +1,189 @@
+let map3d;
+let placesService;
+let streetViewService;
+let panorama;
+let activeMarkers = [];
+let activeChart = null;
+let Marker3DInteractiveElement;
+
+const COSTA_RICA_CENTER = { lat: 9.934739, lng: -84.087502, altitude: 500000 };
+const SAFETY_KEYWORDS = ['secure', 'safe', 'well-lit', 'lit', 'neighborhood', 'friendly', 'guarded', 'patrolled'];
+
+async function initMap() {
+  const { Map3DElement, MapMode, Marker3DInteractiveElement: InteractiveMarker } = await google.maps.importLibrary("maps3d");
+  const { Place, SearchNearbyRankPreference } = await google.maps.importLibrary("places");
+  const { StreetViewService, StreetViewPanorama } = await google.maps.importLibrary("streetView");
+
+  Marker3DInteractiveElement = InteractiveMarker;
+
+  map3d = new Map3DElement({
+    center: COSTA_RICA_CENTER,
+    tilt: 0,
+    heading: 0,
+    zoom: 8,
+    mode: MapMode.HYBRID,
+  });
+
+  document.getElementById('map-container').appendChild(map3d);
+  streetViewService = new StreetViewService();
+  panorama = new StreetViewPanorama(document.getElementById('pano'));
+
+  const autocomplete = document.querySelector('gmp-basic-place-autocomplete');
+  autocomplete.addEventListener('gmp-select', async (event) => {
+    const place = event.place;
+    if (!place.location) return;
+    map3d.flyCameraTo({ center: { lat: place.location.lat(), lng: place.location.lng(), altitude: 2000 }, tilt: 67.5, heading: 0, zoom: 18 });
+  });
+
+  document.getElementById('find-sodas-btn').addEventListener('click', () => searchNearby('restaurant'));
+  document.getElementById('find-beaches-btn').addEventListener('click', () => searchNearby('beach'));
+  document.getElementById('close-street-view-btn').addEventListener('click', () => {
+    document.getElementById('street-view-modal').classList.add('hidden');
+  });
+}
+
+async function searchNearby(type) {
+  clearResults();
+  const statusMessage = document.getElementById('status-message');
+  statusMessage.textContent = `Searching for nearby ${type}s...`;
+
+  const { Place } = await google.maps.importLibrary("places");
+  const request = {
+    includedTypes: [type],
+    locationRestriction: {
+      center: { lat: map3d.center.lat, lng: map3d.center.lng },
+      radius: 10000, // 10km radius
+    },
+    maxResultCount: 10,
+  };
+
+  try {
+    const { places } = await Place.searchNearby(request);
+    if (places.length) {
+      statusMessage.style.display = 'none';
+      places.forEach(place => createPlaceCardAndMarker(place));
+    } else {
+      statusMessage.textContent = 'No places found. Try a different area.';
+    }
+  } catch (error) {
+    console.error('Nearby search failed:', error);
+    statusMessage.textContent = 'Error finding places.';
+  }
+}
+
+function createPlaceCardAndMarker(place) {
+  const list = document.getElementById('places-list');
+
+  const marker = new Marker3DInteractiveElement({
+    position: place.location,
+    title: place.displayName,
+  });
+  map3d.appendChild(marker);
+
+  const card = document.createElement('li');
+  card.className = 'place-card';
+  card.innerHTML = `<h3>${place.displayName}</h3><div class="place-card-details"></div>`;
+  list.appendChild(card);
+
+  const clickHandler = () => {
+    document.querySelectorAll('.place-card').forEach(c => c.classList.remove('selected'));
+    card.classList.add('selected');
+    map3d.flyCameraTo({ center: { lat: place.location.lat(), lng: place.location.lng(), altitude: 1000 }, tilt: 67.5, heading: 120, zoom: 19 });
+    showPlaceDetails(card.querySelector('.place-card-details'), place);
+  };
+
+  marker.addEventListener('gmp-click', clickHandler);
+  card.addEventListener('click', clickHandler);
+  activeMarkers.push(marker);
+}
+
+async function showPlaceDetails(detailsContainer, place) {
+  detailsContainer.innerHTML = '<p>Loading details...</p>';
+  await place.fetchFields({ fields: ['reviews', 'regularOpeningHours', 'websiteURI', 'photos'] });
+
+  const safety = analyzeReviewsForSafety(place.reviews);
+  const safetyBadge = `<div class="safety-badge ${safety.isSafe ? 'safe' : 'unknown'}">
+    <i class="material-icons">${safety.isSafe ? 'health_and_safety' : 'gpp_maybe'}</i>
+    <span>${safety.isSafe ? 'Safety keywords found:' : 'No safety keywords found'}</span>
+    ${safety.keywords.length > 0 ? `<span class="keywords">${safety.keywords.join(', ')}</span>` : ''}
+  </div>`;
+
+  const busynessGraph = '<div class="busyness-graph-container"><canvas></canvas></div>';
+  const streetViewBtn = `<button class="button street-view-btn" data-lat="${place.location.lat()}" data-lng="${place.location.lng()}"><i class="material-icons">streetview</i> Street View</button>`;
+
+  detailsContainer.innerHTML = safetyBadge + busynessGraph + (place.regularOpeningHours?.weekdayDescriptions?.join('<br>') || 'Opening hours not available.') + streetViewBtn;
+
+  renderBusynessChart(detailsContainer.querySelector('canvas'));
+
+  detailsContainer.querySelector('.street-view-btn').addEventListener('click', (e) => {
+    const lat = parseFloat(e.currentTarget.dataset.lat);
+    const lng = parseFloat(e.currentTarget.dataset.lng);
+    showStreetView({ lat, lng });
+  });
+}
+
+function analyzeReviewsForSafety(reviews) {
+  if (!reviews || reviews.length === 0) return { isSafe: false, keywords: [] };
+  const foundKeywords = new Set();
+  reviews.forEach(review => {
+    const text = review.text?.toLowerCase() || '';
+    SAFETY_KEYWORDS.forEach(keyword => {
+      if (text.includes(keyword)) {
+        foundKeywords.add(keyword);
+      }
+    });
+  });
+  return { isSafe: foundKeywords.size > 0, keywords: [...foundKeywords] };
+}
+
+function renderBusynessChart(canvas) {
+  if (activeChart) {
+    activeChart.destroy();
+  }
+  const hours = Array.from({ length: 12 }, (_, i) => `${i + 8} AM`);
+  const data = Array.from({ length: 12 }, () => Math.random() * 100);
+
+  activeChart = new Chart(canvas.getContext('2d'), {
+    type: 'bar',
+    data: {
+      labels: hours,
+      datasets: [{
+        label: 'Estimated Busyness',
+        data: data,
+        backgroundColor: 'rgba(0, 150, 136, 0.6)',
+        borderColor: 'rgba(0, 150, 136, 1)',
+        borderWidth: 1
+      }]
+    },
+    options: {
+      plugins: { legend: { display: false }, title: { display: true, text: 'Popular Times (Placeholder)' } },
+      scales: { y: { beginAtZero: true, display: false }, x: { ticks: { font: { size: 8 } } } }
+    }
+  });
+}
+
+function showStreetView(location) {
+  streetViewService.getPanorama({ location, radius: 50 }, (data, status) => {
+    if (status === 'OK') {
+      panorama.setPano(data.location.pano);
+      panorama.setPov({ heading: 270, pitch: 0 });
+      panorama.setVisible(true);
+      document.getElementById('street-view-modal').classList.remove('hidden');
+    } else {
+      console.error('Street View data not available for this location. Status:', status);
+      const statusMessage = document.getElementById('status-message');
+      statusMessage.textContent = 'Street View data not available for this location.';
+      statusMessage.style.display = 'block';
+    }
+  });
+}
+
+function clearResults() {
+  activeMarkers.forEach(marker => marker.remove());
+  activeMarkers = [];
+  document.getElementById('places-list').innerHTML = '';
+  document.getElementById('status-message').style.display = 'block';
+  document.getElementById('status-message').textContent = 'Search for a place to begin your discovery.';
+}
+
+initMap();
